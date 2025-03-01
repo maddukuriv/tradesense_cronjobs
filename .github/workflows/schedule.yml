@@ -1,0 +1,28 @@
+name: Schedule Supabase Edge Function
+
+on:
+  schedule:
+    - cron: "20 16 * * *" # Runs every day at 4:20 PM UTC
+
+jobs:
+  trigger-function:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: "14"
+
+      - name: Install Supabase CLI
+        run: npm install -g supabase
+
+      - name: Trigger Supabase Edge Function
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          supabase functions invoke stock_data_scraping
