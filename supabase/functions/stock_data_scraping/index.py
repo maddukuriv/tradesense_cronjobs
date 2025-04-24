@@ -36,117 +36,83 @@ Midcap = load_tickers('midcap.json')
 Smallcap = load_tickers('smallcap.json')
 Indices = load_tickers('indices.json')
 
-# ✅ Today's date
+batch_size = 50  # Adjust batch size to optimize performance without hitting API limits
+
+# Get the last recorded date in the database
+latest_date_query = supabase.table("stock_data").select("date").order("date", desc=True).limit(1).execute()
+latest_date = latest_date_query.data[0]['date'] if latest_date_query.data else None
+
+# Define today’s date
 today = datetime.now().strftime('%Y-%m-%d')
 
-# ✅ Get last available date from Supabase for a given ticker
-def get_last_date_for_ticker(ticker):
-    try:
-        response = supabase.table("stock_data").select("date").eq("ticker", ticker).order("date", desc=True).limit(1).execute()
-        if response.data:
-            return response.data[0]['date']
-        else:
-            return None
-    except Exception as e:
-        print(f"⚠️ Error fetching last date for {ticker}: {e}")
-        return None
+# Determine the start date (fetch only missing days)
+if latest_date:
+    last_fetched_date = datetime.strptime(latest_date, '%Y-%m-%d')
+    start_date = (last_fetched_date + timedelta(days=1)).strftime('%Y-%m-%d')  # Start from next missing date
+else:
+    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')  # Fetch last 1 year if no data exists
 
-# ✅ Sanitize NaN to None for JSON compatibility
-def sanitize_json(data):
-    def sanitize_value(val):
-        if isinstance(val, float) and math.isnan(val):
-            return None
-        return val
+# Ensure we only fetch data if needed
+if start_date >= today:
+    print("No new stock data to fetch.")
+    exit()
 
-    if isinstance(data, list):
-        return [sanitize_json(item) for item in data]
-    elif isinstance(data, dict):
-        return {k: sanitize_value(v) for k, v in data.items()}
-    else:
-        return sanitize_value(data)
-
-# ✅ Fetch missing data for tickers
-def fetch_stock_data(tickers_batch, results):
+# Function to fetch historical stock data with rate limit handling
+def fetch_stock_data(tickers_batch, start_date, end_date, results):
     for ticker in tickers_batch:
-        last_date = get_last_date_for_ticker(ticker)
-
-        if last_date:
-            start_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-        else:
-            start_date = (datetime.now() - timedelta(days=5*365)).strftime('%Y-%m-%d')
-
-        end_date = today
-
-        if datetime.strptime(start_date, '%Y-%m-%d') > datetime.now():
-            print(f"✅ No new data needed for {ticker}. Skipping...")
-            continue
-
-        retries = 3
+        retries = 3  # Retry up to 3 times if request fails
         while retries > 0:
             try:
-                time.sleep(1.5)  # Rate limiting
+                time.sleep(1.5)  # Avoid hitting API rate limits
                 stock = yf.Ticker(ticker)
                 stock_data = stock.history(start=start_date, end=end_date)
 
                 if stock_data.empty:
-                    print(f"⚠️ No data for {ticker} from {start_date} to {end_date}")
-                    break
+                    print(f"Warning: No data found for {ticker}")
+                    break  # No need to retry if no data exists
 
-                stock_data.reset_index(inplace=True)
-                stock_data.rename(columns={'Date': 'date'}, inplace=True)
                 stock_data['ticker'] = ticker
-                stock_data['date'] = stock_data['date'].dt.strftime('%Y-%m-%d')
                 stock_data.columns = [col.lower() for col in stock_data.columns]
+                stock_data = stock_data.reset_index()
+                stock_data.rename(columns={"Date": "date"}, inplace=True)
+                stock_data['date'] = stock_data['date'].astype(str)
 
                 required_columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'ticker']
-                stock_data = stock_data[required_columns]
-                stock_data = stock_data.where(pd.notnull(stock_data), None)
+                results.extend(stock_data[required_columns].to_dict(orient="records"))
 
-                results.extend(stock_data.to_dict(orient="records"))
-                print(f"✅ {ticker} updated from {start_date} to {end_date}")
-                break
+                print(f"✅ Fetched data for {ticker} ({start_date} to {end_date})")
+                break  # Success, exit retry loop
 
             except Exception as e:
-                print(f"⚠️ Error fetching data for {ticker}: {e}")
+                print(f"⚠️ Failed to fetch data for {ticker}: {e}")
                 retries -= 1
-                time.sleep(3)
+                time.sleep(3)  # Wait 3 seconds before retrying
 
-# ✅ Process a set of tickers
-def process_tickers(tickers):
-    batch_size = 50
-    insert_batch_size = 100
+# ✅ Fetch & update missing stock data using multithreading
+print(f"Fetching missing stock data from {start_date} to {today}")
 
-    updated_data = []
-    threads = []
+updated_data = []
+threads = []
 
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
-        thread = threading.Thread(target=fetch_stock_data, args=(batch, updated_data))
-        threads.append(thread)
-        thread.start()
-        time.sleep(2)
+for i in range(0, len(tickers), batch_size):
+    batch = tickers[i:i + batch_size]
+    thread = threading.Thread(target=fetch_stock_data, args=(batch, start_date, today, updated_data))
+    threads.append(thread)
+    thread.start()
+    time.sleep(2)  # Short delay to prevent excessive API calls
 
-    for thread in threads:
-        thread.join()
+for thread in threads:
+    thread.join()
 
-    if updated_data:
-        try:
-            for i in range(0, len(updated_data), insert_batch_size):
-                batch = sanitize_json(updated_data[i:i + insert_batch_size])
-                supabase.table("stock_data").upsert(batch).execute()
-                print(f"✅ Batch upserted, records {i+1} to {i+len(batch)}")
-
-            print("✅ Missing stock data successfully updated in Supabase.")
-        except Exception as e:
-            print(f"⚠️ Error inserting stock data: {e}")
-
-    # ✅ Delete data older than 5 years
-    five_year_ago = (datetime.now() - timedelta(days=5*365)).strftime('%Y-%m-%d')
+# Insert the fetched data into the database
+if updated_data:
     try:
-        supabase.table("stock_data").delete().filter("date", "lt", five_year_ago).execute()
-        print("✅ Old data deleted (older than 5 years).")
+        supabase.table("stock_data").insert(updated_data).execute()
+        print("✅ Stock data successfully updated in Supabase.")
     except Exception as e:
-        print(f"⚠️ Error deleting old data: {e}")
+        print(f"⚠️ Error inserting stock data: {e}")
+else:
+    print("✅ All stock data is already up to date. No upsert needed.")
 
 # ✅ Run the process for each cap category
 for cap_name, tickers in [("Largecap", Largecap), ("Midcap", Midcap), ("Smallcap", Smallcap), ("Indices", Indices)]:
